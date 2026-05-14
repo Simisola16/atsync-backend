@@ -4,7 +4,7 @@ const router = express.Router();
 const User = require('../models/User');
 const jwt = require('jsonwebtoken');
 const { v4: uuidv4 } = require('uuid');
-const Resend = require('resend');
+const { Resend } = require('resend');
 const resend = new Resend(process.env.RESEND_API_KEY);
 
 // Helper to send verification email
