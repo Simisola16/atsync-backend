@@ -13,6 +13,14 @@ router.post('/register', async (req, res) => {
     return res.status(400).json({ message: 'All fields are required' });
   }
   try {
+    let clientUrl = process.env.CLIENT_URL || 'https://atsync.app';
+    if (clientUrl.includes('localhost')) {
+      clientUrl = 'https://atsync.app';
+    }
+    if (clientUrl.endsWith('/')) {
+      clientUrl = clientUrl.slice(0, -1);
+    }
+
     // Generate signup confirmation link via Supabase Admin API
     const { data: linkData, error: linkError } = await supabase.auth.admin.generateLink({
       type: 'signup',
@@ -20,7 +28,7 @@ router.post('/register', async (req, res) => {
       password,
       options: {
         data: { agency_name: agencyName },
-        redirectTo: `${process.env.CLIENT_URL || 'https://atsync.app'}/agent-onboard`
+        redirectTo: `${clientUrl}/agent-onboard`
       }
     });
 
