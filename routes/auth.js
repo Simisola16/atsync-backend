@@ -2,6 +2,8 @@
 const express = require('express');
 const router = express.Router();
 const supabase = require('../config/supabase');
+const { Resend } = require('resend');
+const resend = new Resend(process.env.RESEND_API_KEY);
 
 // @route   POST /api/auth/register
 // @desc    Register new agency user via Supabase Auth
@@ -33,6 +35,17 @@ router.post('/register', async (req, res) => {
     }
 
     res.status(201).json({ message: 'User registered. Please check your email to verify.' });
+        // Send verification email via Resend
+        try {
+          await resend.emails.send({
+            from: 'no-reply@atsync.com',
+            to: email,
+            subject: 'Verify your ATSYNC account',
+            html: `<p>Hello ${agencyName},</p><p>Thank you for registering. Please verify your email by clicking the link below:</p><p><a href="${process.env.FRONTEND_URL}/verify?email=${encodeURIComponent(email)}">Verify Email</a></p><p>If you did not sign up, ignore this email.</p>`
+          });
+        } catch (e) {
+          console.error('Resend email error:', e);
+        }
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: 'Server error' });
