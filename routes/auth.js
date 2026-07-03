@@ -182,7 +182,7 @@ router.post('/forgot-password', async (req, res) => {
 // @route   GET /api/auth/verify
 // @desc    Verify email token_hash and redirect to frontend with session
 router.get('/verify', async (req, res) => {
-  const { token_hash, type } = req.query;
+  const { token_hash, type, intake } = req.query;
   const clientUrl = 'https://atsync.app';
   
   if (!token_hash) {
@@ -319,9 +319,14 @@ router.get('/verify', async (req, res) => {
 
     // Success! Redirect to frontend with access_token and refresh_token
     const session = data.session;
-    const targetUrl = type === 'recovery' 
-      ? `${clientUrl}/reset`
-      : `${clientUrl}/agent-onboard`;
+    let targetUrl;
+    if (type === 'recovery') {
+      targetUrl = `${clientUrl}/reset`;
+    } else if (type === 'invite') {
+      targetUrl = `${clientUrl}/client/signup?intake=${intake || ''}`;
+    } else {
+      targetUrl = `${clientUrl}/agent-onboard`;
+    }
 
     // Construct the redirect URL with hash parameters
     const redirectUrl = `${targetUrl}#access_token=${session.access_token}&refresh_token=${session.refresh_token}&type=${type || 'signup'}`;
@@ -547,6 +552,121 @@ router.post('/invite-client', async (req, res) => {
   } catch (err) {
     console.error('Invite client error:', err);
     res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// @route   POST /api/auth/send-invite
+// @desc    Generate a Supabase invite link and send it via Resend
+router.post('/send-invite', async (req, res) => {
+  const { intakeId, agencyId, email } = req.body;
+
+  if (!intakeId || !agencyId) {
+    return res.status(400).json({ message: 'intakeId and agencyId are required' });
+  }
+
+  try {
+    // 1. Fetch the intake submission details
+    const { data: intake, error: intakeError } = await supabase
+      .from('intake_submissions')
+      .select('*')
+      .eq('id', intakeId)
+      .eq('agency_id', agencyId)
+      .single();
+
+    if (intakeError || !intake) {
+      console.error('Fetch intake error:', intakeError);
+      return res.status(404).json({ message: 'Intake submission not found' });
+    }
+
+    if (intake.status !== 'approved') {
+      return res.status(400).json({ message: 'Intake must be approved before sending invite' });
+    }
+
+    const clientEmail = intake.email || email;
+    if (!clientEmail) {
+      return res.status(400).json({ message: 'Client email is required' });
+    }
+
+    // 2. Fetch agency name for the email
+    const { data: agency } = await supabase
+      .from('profiles')
+      .select('agency_name')
+      .eq('id', agencyId)
+      .single();
+
+    const agencyName = agency?.agency_name || 'Your Agency';
+    const clientName = intake.business_name || intake.name || 'Client';
+
+    // 3. Generate invite link via Supabase Admin API
+    const clientUrl = 'https://atsync.app';
+    const { data: linkData, error: linkError } = await supabase.auth.admin.generateLink({
+      type: 'invite',
+      email: clientEmail,
+      options: {
+        redirectTo: `${clientUrl}/client/signup?intake=${intakeId}`
+      }
+    });
+
+    if (linkError) {
+      console.error('generateLink error:', linkError);
+      return res.status(400).json({ message: `Failed to generate invite link: ${linkError.message}` });
+    }
+
+    if (!linkData || !linkData.properties || !linkData.properties.hashed_token) {
+      return res.status(500).json({ message: 'Failed to generate verification token' });
+    }
+
+    const backendUrl = process.env.BACKEND_URL || 'https://atsync-backend-vdko.onrender.com';
+    const actionLink = `${backendUrl}/api/auth/verify?token_hash=${linkData.properties.hashed_token}&type=invite&intake=${intakeId}`;
+
+    // 4. Branded HTML Email Template
+    const htmlContent = `
+<div style="background-color: #0f172a; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; padding: 48px 20px; min-height: 100%;">
+  <div style="background-color: #1e293b; border: 1px solid #334155; border-radius: 12px; margin: 0 auto; max-width: 560px; overflow: hidden; box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.4);">
+    <div style="background-color: #1e293b; border-bottom: 1px solid #334155; padding: 32px 24px; text-align: center;">
+      <span style="font-size: 24px; font-weight: 800; letter-spacing: 0.05em; text-transform: uppercase;">
+        <span style="color: #ffffff;">ATS</span><span style="color: #00e5ff;">YNC</span>
+      </span>
+    </div>
+    <div style="padding: 40px 32px;">
+      <h1 style="color: #ffffff; font-size: 24px; font-weight: 700; line-height: 32px; margin-top: 0; margin-bottom: 16px;">You've been invited to your client portal!</h1>
+      <p style="color: #cbd5e1; font-size: 16px; line-height: 24px; margin-top: 0; margin-bottom: 24px;">Hi ${clientName},</p>
+      <p style="color: #cbd5e1; font-size: 16px; line-height: 24px; margin-top: 0; margin-bottom: 24px;"><strong style="color: #ffffff;">${agencyName}</strong> has reviewed your request. Click below to set up your ATSYNC account and access your private client portal.</p>
+      <div style="margin: 36px 0; text-align: center;">
+        <a href="${actionLink}" style="background: linear-gradient(135deg, #00e5ff 0%, #6C47FF 100%); border-radius: 6px; color: #0f172a; display: inline-block; font-size: 16px; font-weight: 700; line-height: 50px; text-align: center; text-decoration: none; width: 240px; box-shadow: 0 4px 12px rgba(0, 229, 255, 0.25);">Set up your account</a>
+      </div>
+      <p style="color: #94a3b8; font-size: 14px; line-height: 20px; margin-top: 0; margin-bottom: 24px;">In your client portal, you can track progress, message ${agencyName}, view project briefs, and manage invoices.</p>
+      <hr style="border: 0; border-top: 1px solid #334155; margin: 32px 0;" />
+      <p style="color: #94a3b8; font-size: 12px; line-height: 18px; margin-top: 0; margin-bottom: 8px;">If you're having trouble clicking the button, copy and paste this URL into your browser:</p>
+      <p style="margin-top: 0; margin-bottom: 0; word-break: break-all;"><a href="${actionLink}" style="color: #00e5ff; font-size: 12px; text-decoration: none; word-break: break-all;">${actionLink}</a></p>
+    </div>
+    <div style="background-color: #0f172a; border-top: 1px solid #334155; padding: 24px 32px; text-align: center;">
+      <p style="color: #64748b; font-size: 12px; line-height: 18px; margin-top: 0; margin-bottom: 4px;">© 2026 ATSYNC. All rights reserved.</p>
+      <p style="color: #64748b; font-size: 12px; line-height: 18px; margin-top: 0; margin-bottom: 0;">Need help? <a href="mailto:atlassync1@gmail.com" style="color: #00e5ff; text-decoration: none;">atlassync1@gmail.com</a></p>
+    </div>
+  </div>
+</div>
+`;
+
+    const { error: emailError } = await resend.emails.send({
+      from: 'support@atsync.app',
+      reply_to: 'support@atsync.app',
+      to: clientEmail,
+      subject: `${agencyName} has approved your request — set up your ATSYNC account`,
+      html: htmlContent,
+      text: `Hi ${clientName}, ${agencyName} has approved your request. Set up your account here: ${actionLink}`,
+    });
+
+    if (emailError) {
+      console.error('Resend email error:', emailError);
+      return res.status(500).json({ message: 'Failed to send verification email via Resend' });
+    }
+
+    res.status(200).json({ message: 'Invite email sent successfully' });
+
+  } catch (err) {
+    console.error('Send invite error:', err);
+    res.status(500).json({ message: 'Server error while sending invite' });
   }
 });
 
