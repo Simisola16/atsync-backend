@@ -16,6 +16,7 @@ async function deleteAllUsers() {
     process.exit(1);
   }
 
+  
   const users = data.users;
   console.log(`Found ${users.length} user(s). Deleting...`);
 
@@ -32,3 +33,4 @@ async function deleteAllUsers() {
 }
 
 deleteAllUsers();
+
