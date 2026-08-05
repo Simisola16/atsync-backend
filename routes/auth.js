@@ -1,673 +1,246 @@
 // backend/routes/auth.js
 const express = require('express');
 const router = express.Router();
-const supabase = require('../config/supabase');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const User = require('../models/User');
+const Profile = require('../models/Profile');
 const { Resend } = require('resend');
-const resend = new Resend(process.env.RESEND_API_KEY);
+
+const resend = new Resend(process.env.RESEND_API_KEY || 'dummy_key');
+const JWT_SECRET = process.env.JWT_SECRET || 'atsync_jwt_secret_key_123';
+
+// Auth middleware
+const authMiddleware = async (req, res, next) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ message: 'No authentication token provided' });
+  }
+  const token = authHeader.split(' ')[1];
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    const user = await User.findById(decoded.id).select('-password');
+    if (!user) {
+      return res.status(401).json({ message: 'Invalid session' });
+    }
+    req.user = user;
+    next();
+  } catch (err) {
+    return res.status(401).json({ message: 'Invalid or expired token' });
+  }
+};
 
 // @route   POST /api/auth/register
-// @desc    Register new agency user via Supabase Auth
+// @desc    Register new agency user and send verification OTP
 router.post('/register', async (req, res) => {
   const { agencyName, email, password } = req.body;
   if (!agencyName || !email || !password) {
     return res.status(400).json({ message: 'All fields are required' });
   }
-  try {
-    // Use production domain for email verification redirects, ignore any localhost settings.
-    const clientUrl = 'https://atsync.app';
 
-    // Generate signup confirmation link via Supabase Admin API
-    const { data: linkData, error: linkError } = await supabase.auth.admin.generateLink({
-      type: 'signup',
-      email,
-      password,
-      options: {
-        data: { agency_name: agencyName },
-        redirectTo: `${clientUrl}/agent-onboard`
-      }
+  try {
+    const existingUser = await User.findOne({ email: email.toLowerCase() });
+    if (existingUser) {
+      return res.status(400).json({ message: 'User with this email already exists' });
+    }
+
+    const salt = await bcrypt.genSalt(10);
+    const hashedPassword = await bcrypt.hash(password, salt);
+    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    const otpExpires = new Date(Date.now() + 15 * 60 * 1000); // 15 minutes
+
+    const user = new User({
+      email: email.toLowerCase(),
+      password: hashedPassword,
+      agencyName,
+      role: 'agency',
+      isVerified: false,
+      otp,
+      otpExpires
     });
 
-    if (linkError) {
-      return res.status(400).json({ message: linkError.message });
-    }
+    await user.save();
 
-    if (!linkData || !linkData.properties || !linkData.properties.hashed_token) {
-      return res.status(500).json({ message: 'Failed to generate verification link' });
-    }
+    await Profile.create({
+      userId: user._id,
+      agencyName,
+      email: email.toLowerCase()
+    });
 
-    const backendUrl = process.env.BACKEND_URL || 'https://atsync-backend-vdko.onrender.com';
-    const actionLink = `${backendUrl}/api/auth/verify?token_hash=${linkData.properties.hashed_token}&type=signup`;
-
-    // Insert agency profile in profiles table
-    if (linkData.user) {
-      const { error: profileError } = await supabase.from('profiles').upsert({
-        id: linkData.user.id,
-        agency_name: agencyName,
-        email: email,
-      });
-      if (profileError) {
-        console.error('Profile upsert error:', profileError);
+    // Send email with OTP via Resend if configured
+    if (process.env.RESEND_API_KEY) {
+      try {
+        await resend.emails.send({
+          from: 'ATSYNC <noreply@atsync.app>',
+          to: email,
+          subject: `${otp} is your ATSYNC verification code`,
+          html: `<p>Your verification code for ATSYNC is <strong>${otp}</strong>. It expires in 15 minutes.</p>`
+        });
+      } catch (emailErr) {
+        console.error('Failed to send verification email:', emailErr);
       }
     }
 
-    // Professional HTML Email Template
-    const htmlContent = `
-<div style="background-color: #0f172a; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; padding: 48px 20px; min-height: 100%;">
-  <div style="background-color: #1e293b; border: 1px solid #334155; border-radius: 12px; margin: 0 auto; max-width: 560px; overflow: hidden; box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.4);">
-    <!-- Header -->
-    <div style="background-color: #1e293b; border-bottom: 1px solid #334155; padding: 32px 24px; text-align: center;">
-      <span style="font-size: 24px; font-weight: 800; letter-spacing: 0.05em; text-transform: uppercase;">
-        <span style="color: #ffffff;">ATS</span><span style="color: #00e5ff;">YNC</span>
-      </span>
-    </div>
-    <!-- Content -->
-    <div style="padding: 40px 32px;">
-      <h1 style="color: #ffffff; font-size: 24px; font-weight: 700; line-height: 32px; margin-top: 0; margin-bottom: 16px;">Confirm your registration</h1>
-      <p style="color: #cbd5e1; font-size: 16px; line-height: 24px; margin-top: 0; margin-bottom: 24px;">Hello ${agencyName},</p>
-      <p style="color: #cbd5e1; font-size: 16px; line-height: 24px; margin-top: 0; margin-bottom: 24px;">Thank you for registering. Please verify your email address to complete your ATSYNC account setup and gain access to your dashboard.</p>
-      <div style="margin: 36px 0; text-align: center;">
-        <a href="${actionLink}" style="background: linear-gradient(135deg, #00e5ff 0%, #00bfff 100%); background-color: #00e5ff; border-radius: 6px; color: #0f172a; display: inline-block; font-size: 16px; font-weight: 700; line-height: 50px; text-align: center; text-decoration: none; width: 240px; box-shadow: 0 4px 12px rgba(0, 229, 255, 0.25);">Verify Email Address</a>
-      </div>
-      <p style="color: #94a3b8; font-size: 14px; line-height: 20px; margin-top: 0; margin-bottom: 24px;">This link will expire in 24 hours. If you did not create an ATSYNC account, you can safely ignore this email.</p>
-      <hr style="border: 0; border-top: 1px solid #334155; margin: 32px 0;" />
-      <p style="color: #94a3b8; font-size: 12px; line-height: 18px; margin-top: 0; margin-bottom: 8px;">If you're having trouble clicking the button, copy and paste this URL into your web browser:</p>
-      <p style="margin-top: 0; margin-bottom: 0; word-break: break-all;"><a href="${actionLink}" style="color: #00e5ff; font-size: 12px; text-decoration: none; word-break: break-all;">${actionLink}</a></p>
-    </div>
-    <!-- Footer -->
-    <div style="background-color: #0f172a; border-top: 1px solid #334155; padding: 24px 32px; text-align: center;">
-      <p style="color: #64748b; font-size: 12px; line-height: 18px; margin-top: 0; margin-bottom: 4px;">© 2026 ATSYNC. All rights reserved.</p>
-      <p style="color: #64748b; font-size: 12px; line-height: 18px; margin-top: 0; margin-bottom: 0;">Need help? Reach out at <a href="mailto:atlassync1@gmail.com" style="color: #00e5ff; text-decoration: none;">atlassync1@gmail.com</a></p>
-    </div>
-  </div>
-</div>
-    `;
-
-    // Send verification email via Resend
-    try {
-      const { data: emailData, error: emailError } = await resend.emails.send({
-        from: 'support@atsync.app', // verified professional sender
-        reply_to: 'support@atsync.app',
-        to: email,
-        subject: 'Activate Your ATSYNC Account',
-        html: htmlContent,
-        text: `Activate your ATSYNC account by clicking the link: ${actionLink}`
-      });
-
-      if (emailError) {
-        console.error('Resend email error:', emailError);
-        return res.status(400).json({ message: `Verification email failed to send: ${emailError.message}` });
-      }
-    } catch (e) {
-      console.error('Resend exception:', e);
-      return res.status(500).json({ message: `Verification email failed to send: ${e.message}` });
-    }
-
-    res.status(201).json({ message: 'User registered. Please check your email to verify.' });
+    return res.status(200).json({
+      message: 'Registration successful. Check your email for OTP verification.',
+      user: { id: user._id, email: user.email, agencyName: user.agencyName }
+    });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ message: 'Server error' });
+    console.error('Registration error:', err);
+    return res.status(500).json({ message: err.message || 'Server error' });
   }
 });
 
- // @route   POST /api/auth/forgot-password
-// @desc    Send password reset email via Supabase and Resend
-router.post('/forgot-password', async (req, res) => {
-  const { email } = req.body;
-  if (!email) {
-    return res.status(400).json({ message: 'Email is required' });
-  }
-  try {
-    // Use Supabase Admin API to generate a password recovery link
-    const { data: linkData, error: linkError } = await supabase.auth.admin.generateLink({
-      type: 'recovery',
-      email,
-      options: {
-        redirectTo: 'https://atsync.app/reset', // front‑end reset page (no localhost)
-      },
-    });
-    if (linkError) {
-      return res.status(400).json({ message: linkError.message });
-    }
-
-    if (!linkData || !linkData.properties || !linkData.properties.hashed_token) {
-      return res.status(500).json({ message: 'Failed to generate reset link' });
-    }
-
-    const backendUrl = process.env.BACKEND_URL || 'https://atsync-backend-vdko.onrender.com';
-    const actionLink = `${backendUrl}/api/auth/verify?token_hash=${linkData.properties.hashed_token}&type=recovery`;
-
-    const htmlContent = `
-      <div style="background-color:#0f172a;font-family:Arial,Helvetica,sans-serif;padding:48px 20px;min-height:100%;">
-        <div style="background-color:#1e293b;border:1px solid #334155;border-radius:12px;margin:0 auto;max-width:560px;overflow:hidden;box-shadow:0 10px 25px -5px rgba(0,0,0,0.4);">
-          <div style="background-color:#1e293b;border-bottom:1px solid #334155;padding:32px 24px;text-align:center;">
-            <span style="font-size:24px;font-weight:800;letter-spacing:0.05em;text-transform:uppercase;color:#00e5ff;">ATSYNC Password Reset</span>
-          </div>
-          <div style="padding:40px 32px;">
-            <h1 style="color:#ffffff;font-size:24px;font-weight:700;margin-bottom:16px;">Reset Your Password</h1>
-            <p style="color:#cbd5e1;font-size:16px;line-height:24px;margin-bottom:24px;">We received a request to reset the password for your ATSYNC account.</p>
-            <div style="text-align:center;margin:36px 0;">
-              <a href="${actionLink}" style="background:#00e5ff;border-radius:6px;color:#0f172a;display:inline-block;font-size:16px;font-weight:700;line-height:50px;text-decoration:none;width:240px;box-shadow:0 4px 12px rgba(0,229,255,0.25);">Reset Password</a>
-            </div>
-            <p style="color:#94a3b8;font-size:12px;line-height:18px;">If the button doesn't work, copy and paste this URL into your browser:</p>
-            <p style="font-size:12px;color:#00e5ff;word-break:break-all;">${actionLink}</p>
-          </div>
-          <div style="background-color:#0f172a;border-top:1px solid #334155;padding:24px 32px;text-align:center;">
-            <p style="color:#64748b;font-size:12px;">© 2026 ATSYNC. All rights reserved.</p>
-            <p style="color:#64748b;font-size:12px;">Need help? <a href="mailto:atlassync1@gmail.com" style="color:#00e5ff;">atlassync1@gmail.com</a></p>
-          </div>
-        </div>
-      </div>
-    `;
-
-    // Send email via Resend
-    const { error: emailError } = await resend.emails.send({
-      from: 'support@atsync.app',
-      reply_to: 'support@atsync.app',
-      to: email,
-      subject: 'ATSYNC – Password Reset Request',
-      html: htmlContent,
-      text: `Reset your ATSYNC password using this link: ${actionLink}`,
-    });
-    if (emailError) {
-      console.error('Resend email error:', emailError);
-      return res.status(500).json({ message: 'Failed to send reset email' });
-    }
-    return res.status(200).json({ message: 'Password reset email sent' });
-  } catch (err) {
-    console.error(err);
-    return res.status(500).json({ message: 'Server error' });
-  }
-});
-
-// @route   GET /api/auth/verify
-// @desc    Verify email token_hash and redirect to frontend with session
-router.get('/verify', async (req, res) => {
-  const { token_hash, type, intake } = req.query;
-  const clientUrl = 'https://atsync.app';
-  
-  if (!token_hash) {
-    return res.status(400).send(`
-      <html>
-        <head>
-          <title>Verification Failed | ATSYNC</title>
-          <meta name="viewport" content="width=device-width, initial-scale=1.0">
-          <style>
-            body {
-              margin: 0;
-              padding: 0;
-              display: flex;
-              justify-content: center;
-              align-items: center;
-              height: 100vh;
-              background-color: #0f172a;
-              color: #ffffff;
-              font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            }
-            .card {
-              background-color: #1e293b;
-              border: 1px solid #334155;
-              border-radius: 16px;
-              padding: 40px;
-              max-width: 480px;
-              width: 90%;
-              text-align: center;
-              box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.5);
-            }
-            h1 {
-              color: #ef4444;
-              font-size: 28px;
-              margin-bottom: 16px;
-            }
-            p {
-              color: #94a3b8;
-              font-size: 16px;
-              line-height: 1.6;
-              margin-bottom: 24px;
-            }
-            .btn {
-              background: linear-gradient(135deg, #ef4444 0%, #dc2626 100%);
-              color: #ffffff;
-              border-radius: 8px;
-              padding: 12px 32px;
-              text-decoration: none;
-              font-weight: 700;
-              display: inline-block;
-              box-shadow: 0 4px 12px rgba(239, 68, 68, 0.2);
-            }
-          </style>
-        </head>
-        <body>
-          <div class="card">
-            <h1>Verification Failed</h1>
-            <p>The verification link is missing required parameters. Please request a new verification email from the homepage.</p>
-            <a href="${clientUrl}" class="btn">Go to Homepage</a>
-          </div>
-        </body>
-      </html>
-    `);
+// @route   POST /api/auth/verify-otp
+// @desc    Verify email OTP
+router.post('/verify-otp', async (req, res) => {
+  const { email, otp } = req.body;
+  if (!email || !otp) {
+    return res.status(400).json({ message: 'Email and OTP are required' });
   }
 
   try {
-    // Verify the OTP via Supabase
-    const { data, error } = await supabase.auth.verifyOtp({
-      token_hash,
-      type: type || 'signup'
+    const user = await User.findOne({ email: email.toLowerCase() });
+    if (!user) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+
+    if (user.otp !== otp || user.otpExpires < new Date()) {
+      return res.status(400).json({ message: 'Invalid or expired OTP' });
+    }
+
+    user.isVerified = true;
+    user.otp = undefined;
+    user.otpExpires = undefined;
+    await user.save();
+
+    const token = jwt.sign({ id: user._id, email: user.email, role: user.role }, JWT_SECRET, { expiresIn: '7d' });
+    const profile = await Profile.findOne({ userId: user._id });
+
+    return res.status(200).json({
+      token,
+      user: {
+        id: user._id,
+        email: user.email,
+        agencyName: user.agencyName,
+        role: user.role,
+        profile
+      }
     });
-
-    if (error) {
-      console.error('verifyOtp error:', error);
-      return res.status(400).send(`
-        <html>
-          <head>
-            <title>Link Expired | ATSYNC</title>
-            <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <style>
-              body {
-                margin: 0;
-                padding: 0;
-                display: flex;
-                justify-content: center;
-                align-items: center;
-                height: 100vh;
-                background-color: #0f172a;
-                color: #ffffff;
-                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-              }
-              .card {
-                background-color: #1e293b;
-                border: 1px solid #334155;
-                border-radius: 16px;
-                padding: 40px;
-                max-width: 480px;
-                width: 90%;
-                text-align: center;
-                box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.5);
-              }
-              h1 {
-                color: #f59e0b;
-                font-size: 28px;
-                margin-bottom: 16px;
-              }
-              p {
-                color: #94a3b8;
-                font-size: 16px;
-                line-height: 1.6;
-                margin-bottom: 24px;
-              }
-              .btn {
-                background: linear-gradient(135deg, #00e5ff 0%, #00bfff 100%);
-                color: #0f172a;
-                border-radius: 8px;
-                padding: 12px 32px;
-                text-decoration: none;
-                font-weight: 700;
-                display: inline-block;
-                box-shadow: 0 4px 12px rgba(0, 229, 255, 0.25);
-              }
-            </style>
-          </head>
-          <body>
-            <div class="card">
-              <h1>Link Expired or Invalid</h1>
-              <p>This verification link is invalid or has already expired. If you already verified, please try logging in.</p>
-              <a href="${clientUrl}" class="btn">Go to Login</a>
-            </div>
-          </body>
-        </html>
-      `);
-    }
-
-    // Success! Redirect to frontend with access_token and refresh_token
-    const session = data.session;
-    let targetUrl;
-    if (type === 'recovery') {
-      targetUrl = `${clientUrl}/reset`;
-    } else if (type === 'invite') {
-      targetUrl = `${clientUrl}/client/signup?intake=${intake || ''}`;
-    } else {
-      targetUrl = `${clientUrl}/agent-onboard`;
-    }
-
-    // Construct the redirect URL with hash parameters
-    const redirectUrl = `${targetUrl}#access_token=${session.access_token}&refresh_token=${session.refresh_token}&type=${type || 'signup'}`;
-
-    return res.status(200).send(`
-      <html>
-        <head>
-          <title>Email Verified | ATSYNC</title>
-          <meta name="viewport" content="width=device-width, initial-scale=1.0">
-          <style>
-            body {
-              margin: 0;
-              padding: 0;
-              display: flex;
-              justify-content: center;
-              align-items: center;
-              height: 100vh;
-              background-color: #0f172a;
-              color: #ffffff;
-              font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-              overflow: hidden;
-            }
-            .card {
-              background-color: #1e293b;
-              border: 1px solid #334155;
-              border-radius: 16px;
-              padding: 40px;
-              max-width: 480px;
-              width: 90%;
-              text-align: center;
-              box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.5);
-              position: relative;
-            }
-            .success-icon {
-              font-size: 64px;
-              margin-bottom: 24px;
-              animation: scaleUp 0.6s cubic-bezier(0.175, 0.885, 0.32, 1.275) both;
-            }
-            h1 {
-              color: #ffffff;
-              font-size: 28px;
-              margin-bottom: 12px;
-              font-weight: 800;
-            }
-            span.logo-cyan {
-              color: #00e5ff;
-            }
-            p {
-              color: #94a3b8;
-              font-size: 16px;
-              line-height: 1.6;
-              margin-bottom: 32px;
-            }
-            .loader {
-              width: 48px;
-              height: 48px;
-              border: 3px solid #334155;
-              border-radius: 50%;
-              display: inline-block;
-              position: relative;
-              box-sizing: border-box;
-              animation: rotation 1s linear infinite;
-            }
-            .loader::after {
-              content: '';  
-              box-sizing: border-box;
-              position: absolute;
-              left: 0;
-              top: 0;
-              background: #00e5ff;
-              width: 16px;
-              height: 16px;
-              border-radius: 50%;
-            }
-            @keyframes rotation {
-              0% { transform: rotate(0deg); }
-              100% { transform: rotate(360deg); }
-            }
-            @keyframes scaleUp {
-              0% { transform: scale(0); }
-              100% { transform: scale(1); }
-            }
-          </style>
-          <script>
-            setTimeout(function() {
-              window.location.href = "${redirectUrl}";
-            }, 2500);
-          </script>
-        </head>
-        <body>
-          <div class="card">
-            <div class="success-icon">✨</div>
-            <h1>Email Verified!</h1>
-            <p>Welcome to <span class="logo-cyan">ATSYNC</span>. We've successfully verified your email. Preparing your workspace...</p>
-            <span class="loader"></span>
-          </div>
-        </body>
-      </html>
-    `);
   } catch (err) {
-    console.error('Server verify route error:', err);
-    return res.status(500).send('Server error during verification');
+    return res.status(500).json({ message: err.message });
   }
 });
 
 // @route   POST /api/auth/login
-// @desc    Login user via Supabase Auth and return session details
+// @desc    User login with email and password
 router.post('/login', async (req, res) => {
   const { email, password } = req.body;
   if (!email || !password) {
-    return res.status(400).json({ message: 'Email and password required' });
-  }
-  try {
-    const { data, error } = await supabase.auth.signInWithPassword({
-      email,
-      password,
-    });
-
-    if (error) {
-      return res.status(400).json({ message: error.message });
-    }
-
-    // Fetch user profile
-    const { data: profile } = await supabase
-      .from('profiles')
-      .select('agency_name')
-      .eq('id', data.user.id)
-      .single();
-
-    res.json({
-      token: data.session.access_token,
-      agencyName: profile?.agency_name || data.user.user_metadata?.agency_name || '',
-      email: data.user.email,
-    });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ message: 'Server error' });
-  }
-});
-
-// @route   POST /api/auth/invite-client
-// @desc    Auto-invite an approved client via email after agency approves intake
-router.post('/invite-client', async (req, res) => {
-  const { intakeId, agencyId } = req.body;
-
-  if (!intakeId || !agencyId) {
-    return res.status(400).json({ message: 'intakeId and agencyId are required' });
+    return res.status(400).json({ message: 'Email and password are required' });
   }
 
   try {
-    // Fetch the intake submission
-    const { data: intake, error: intakeError } = await supabase
-      .from('intake_submissions')
-      .select('*')
-      .eq('id', intakeId)
-      .eq('agency_id', agencyId)
-      .single();
-
-    if (intakeError || !intake) {
-      return res.status(404).json({ message: 'Intake submission not found' });
+    const user = await User.findOne({ email: email.toLowerCase() });
+    if (!user) {
+      return res.status(400).json({ message: 'Invalid credentials' });
     }
 
-    if (intake.status !== 'approved') {
-      return res.status(400).json({ message: 'Intake must be approved before inviting client' });
+    const isMatch = await bcrypt.compare(password, user.password);
+    if (!isMatch) {
+      return res.status(400).json({ message: 'Invalid credentials' });
     }
 
-    const clientUrl = 'https://atsync.app';
-    const signupUrl = `${clientUrl}/client/signup?intake=${intakeId}`;
+    const token = jwt.sign({ id: user._id, email: user.email, role: user.role }, JWT_SECRET, { expiresIn: '7d' });
+    const profile = await Profile.findOne({ userId: user._id });
 
-    // Fetch agency name for the email
-    const { data: agency } = await supabase
-      .from('profiles')
-      .select('agency_name')
-      .eq('id', agencyId)
-      .single();
-
-    const agencyName = agency?.agency_name || 'Your agency';
-    const clientName = intake.business_name || intake.name;
-
-    const htmlContent = `
-<div style="background-color: #0f172a; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; padding: 48px 20px; min-height: 100%;">
-  <div style="background-color: #1e293b; border: 1px solid #334155; border-radius: 12px; margin: 0 auto; max-width: 560px; overflow: hidden; box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.4);">
-    <div style="background-color: #1e293b; border-bottom: 1px solid #334155; padding: 32px 24px; text-align: center;">
-      <span style="font-size: 24px; font-weight: 800; letter-spacing: 0.05em; text-transform: uppercase;">
-        <span style="color: #ffffff;">ATS</span><span style="color: #00e5ff;">YNC</span>
-      </span>
-    </div>
-    <div style="padding: 40px 32px;">
-      <h1 style="color: #ffffff; font-size: 24px; font-weight: 700; line-height: 32px; margin-top: 0; margin-bottom: 16px;">You've been approved!</h1>
-      <p style="color: #cbd5e1; font-size: 16px; line-height: 24px; margin-top: 0; margin-bottom: 24px;">Hi ${clientName},</p>
-      <p style="color: #cbd5e1; font-size: 16px; line-height: 24px; margin-top: 0; margin-bottom: 24px;"><strong style="color: #ffffff;">${agencyName}</strong> has reviewed your request and approved you as a client. Click below to set up your ATSYNC account and access your client portal.</p>
-      <div style="margin: 36px 0; text-align: center;">
-        <a href="${signupUrl}" style="background: linear-gradient(135deg, #00e5ff 0%, #6C47FF 100%); border-radius: 6px; color: #0f172a; display: inline-block; font-size: 16px; font-weight: 700; line-height: 50px; text-align: center; text-decoration: none; width: 240px; box-shadow: 0 4px 12px rgba(0, 229, 255, 0.25);">Set up your account</a>
-      </div>
-      <p style="color: #94a3b8; font-size: 14px; line-height: 20px; margin-top: 0; margin-bottom: 24px;">Once you set up your account, you'll be able to track your project progress, chat with ${agencyName}, review deliverables, and approve invoices — all in one place.</p>
-      <hr style="border: 0; border-top: 1px solid #334155; margin: 32px 0;" />
-      <p style="color: #94a3b8; font-size: 12px; line-height: 18px; margin-top: 0; margin-bottom: 8px;">If you're having trouble clicking the button, copy and paste this URL into your browser:</p>
-      <p style="margin-top: 0; margin-bottom: 0; word-break: break-all;"><a href="${signupUrl}" style="color: #00e5ff; font-size: 12px; text-decoration: none; word-break: break-all;">${signupUrl}</a></p>
-    </div>
-    <div style="background-color: #0f172a; border-top: 1px solid #334155; padding: 24px 32px; text-align: center;">
-      <p style="color: #64748b; font-size: 12px; line-height: 18px; margin-top: 0; margin-bottom: 4px;">© 2026 ATSYNC. All rights reserved.</p>
-      <p style="color: #64748b; font-size: 12px; line-height: 18px; margin-top: 0; margin-bottom: 0;">Need help? <a href="mailto:atlassync1@gmail.com" style="color: #00e5ff; text-decoration: none;">atlassync1@gmail.com</a></p>
-    </div>
-  </div>
-</div>
-    `;
-
-    const { error: emailError } = await resend.emails.send({
-      from: 'support@atsync.app',
-      reply_to: 'support@atsync.app',
-      to: intake.email,
-      subject: `${agencyName} has approved your request — set up your ATSYNC account`,
-      html: htmlContent,
-      text: `Hi ${clientName}, ${agencyName} has approved your request. Set up your ATSYNC account here: ${signupUrl}`,
-    });
-
-    if (emailError) {
-      console.error('Resend email error:', emailError);
-      return res.status(500).json({ message: 'Invite email failed to send' });
-    }
-
-    res.status(200).json({ message: 'Invite sent successfully' });
-  } catch (err) {
-    console.error('Invite client error:', err);
-    res.status(500).json({ message: 'Server error' });
-  }
-});
-
-// @route   POST /api/auth/send-invite
-// @desc    Generate a Supabase invite link and send it via Resend
-router.post('/send-invite', async (req, res) => {
-  const { intakeId, agencyId, email } = req.body;
-
-  if (!intakeId || !agencyId) {
-    return res.status(400).json({ message: 'intakeId and agencyId are required' });
-  }
-
-  try {
-    // 1. Fetch the intake submission details
-    const { data: intake, error: intakeError } = await supabase
-      .from('intake_submissions')
-      .select('*')
-      .eq('id', intakeId)
-      .eq('agency_id', agencyId)
-      .single();
-
-    if (intakeError || !intake) {
-      console.error('Fetch intake error:', intakeError);
-      return res.status(404).json({ message: 'Intake submission not found' });
-    }
-
-    if (intake.status !== 'approved') {
-      return res.status(400).json({ message: 'Intake must be approved before sending invite' });
-    }
-
-    const clientEmail = intake.email || email;
-    if (!clientEmail) {
-      return res.status(400).json({ message: 'Client email is required' });
-    }
-
-    // 2. Fetch agency name for the email
-    const { data: agency } = await supabase
-      .from('profiles')
-      .select('agency_name')
-      .eq('id', agencyId)
-      .single();
-
-    const agencyName = agency?.agency_name || 'Your Agency';
-    const clientName = intake.business_name || intake.name || 'Client';
-
-    // 3. Generate invite link via Supabase Admin API
-    const clientUrl = 'https://atsync.app';
-    const { data: linkData, error: linkError } = await supabase.auth.admin.generateLink({
-      type: 'invite',
-      email: clientEmail,
-      options: {
-        redirectTo: `${clientUrl}/client/signup?intake=${intakeId}`
+    return res.status(200).json({
+      token,
+      user: {
+        id: user._id,
+        email: user.email,
+        agencyName: user.agencyName,
+        role: user.role,
+        profile
       }
     });
-
-    if (linkError) {
-      console.error('generateLink error:', linkError);
-      return res.status(400).json({ message: `Failed to generate invite link: ${linkError.message}` });
-    }
-
-    if (!linkData || !linkData.properties || !linkData.properties.hashed_token) {
-      return res.status(500).json({ message: 'Failed to generate verification token' });
-    }
-
-    const backendUrl = process.env.BACKEND_URL || 'https://atsync-backend-vdko.onrender.com';
-    const actionLink = `${backendUrl}/api/auth/verify?token_hash=${linkData.properties.hashed_token}&type=invite&intake=${intakeId}`;
-
-    // 4. Branded HTML Email Template
-    const htmlContent = `
-<div style="background-color: #0f172a; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; padding: 48px 20px; min-height: 100%;">
-  <div style="background-color: #1e293b; border: 1px solid #334155; border-radius: 12px; margin: 0 auto; max-width: 560px; overflow: hidden; box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.4);">
-    <div style="background-color: #1e293b; border-bottom: 1px solid #334155; padding: 32px 24px; text-align: center;">
-      <span style="font-size: 24px; font-weight: 800; letter-spacing: 0.05em; text-transform: uppercase;">
-        <span style="color: #ffffff;">ATS</span><span style="color: #00e5ff;">YNC</span>
-      </span>
-    </div>
-    <div style="padding: 40px 32px;">
-      <h1 style="color: #ffffff; font-size: 24px; font-weight: 700; line-height: 32px; margin-top: 0; margin-bottom: 16px;">You've been invited to your client portal!</h1>
-      <p style="color: #cbd5e1; font-size: 16px; line-height: 24px; margin-top: 0; margin-bottom: 24px;">Hi ${clientName},</p>
-      <p style="color: #cbd5e1; font-size: 16px; line-height: 24px; margin-top: 0; margin-bottom: 24px;"><strong style="color: #ffffff;">${agencyName}</strong> has reviewed your request. Click below to set up your ATSYNC account and access your private client portal.</p>
-      <div style="margin: 36px 0; text-align: center;">
-        <a href="${actionLink}" style="background: linear-gradient(135deg, #00e5ff 0%, #6C47FF 100%); border-radius: 6px; color: #0f172a; display: inline-block; font-size: 16px; font-weight: 700; line-height: 50px; text-align: center; text-decoration: none; width: 240px; box-shadow: 0 4px 12px rgba(0, 229, 255, 0.25);">Set up your account</a>
-      </div>
-      <p style="color: #94a3b8; font-size: 14px; line-height: 20px; margin-top: 0; margin-bottom: 24px;">In your client portal, you can track progress, message ${agencyName}, view project briefs, and manage invoices.</p>
-      <hr style="border: 0; border-top: 1px solid #334155; margin: 32px 0;" />
-      <p style="color: #94a3b8; font-size: 12px; line-height: 18px; margin-top: 0; margin-bottom: 8px;">If you're having trouble clicking the button, copy and paste this URL into your browser:</p>
-      <p style="margin-top: 0; margin-bottom: 0; word-break: break-all;"><a href="${actionLink}" style="color: #00e5ff; font-size: 12px; text-decoration: none; word-break: break-all;">${actionLink}</a></p>
-    </div>
-    <div style="background-color: #0f172a; border-top: 1px solid #334155; padding: 24px 32px; text-align: center;">
-      <p style="color: #64748b; font-size: 12px; line-height: 18px; margin-top: 0; margin-bottom: 4px;">© 2026 ATSYNC. All rights reserved.</p>
-      <p style="color: #64748b; font-size: 12px; line-height: 18px; margin-top: 0; margin-bottom: 0;">Need help? <a href="mailto:atlassync1@gmail.com" style="color: #00e5ff; text-decoration: none;">atlassync1@gmail.com</a></p>
-    </div>
-  </div>
-</div>
-`;
-
-    const { error: emailError } = await resend.emails.send({
-      from: 'support@atsync.app',
-      reply_to: 'support@atsync.app',
-      to: clientEmail,
-      subject: `${agencyName} has approved your request — set up your ATSYNC account`,
-      html: htmlContent,
-      text: `Hi ${clientName}, ${agencyName} has approved your request. Set up your account here: ${actionLink}`,
-    });
-
-    if (emailError) {
-      console.error('Resend email error:', emailError);
-      return res.status(500).json({ message: 'Failed to send verification email via Resend' });
-    }
-
-    res.status(200).json({ message: 'Invite email sent successfully' });
-
   } catch (err) {
-    console.error('Send invite error:', err);
-    res.status(500).json({ message: 'Server error while sending invite' });
+    return res.status(500).json({ message: err.message });
+  }
+});
+
+// @route   GET /api/auth/me
+// @desc    Get current user session
+router.get('/me', authMiddleware, async (req, res) => {
+  try {
+    const profile = await Profile.findOne({ userId: req.user._id });
+    return res.status(200).json({
+      user: {
+        id: req.user._id,
+        email: req.user.email,
+        agencyName: req.user.agencyName,
+        role: req.user.role,
+        profile
+      }
+    });
+  } catch (err) {
+    return res.status(500).json({ message: err.message });
+  }
+});
+
+// @route   POST /api/auth/reset-password-request
+router.post('/reset-password-request', async (req, res) => {
+  const { email } = req.body;
+  if (!email) return res.status(400).json({ message: 'Email required' });
+
+  try {
+    const user = await User.findOne({ email: email.toLowerCase() });
+    if (!user) return res.status(200).json({ message: 'If an account exists, a reset code was sent.' });
+
+    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    user.resetPasswordToken = otp;
+    user.resetPasswordExpires = new Date(Date.now() + 15 * 60 * 1000);
+    await user.save();
+
+    if (process.env.RESEND_API_KEY) {
+      await resend.emails.send({
+        from: 'ATSYNC <noreply@atsync.app>',
+        to: email,
+        subject: `Reset your ATSYNC password`,
+        html: `<p>Your password reset code is <strong>${otp}</strong>.</p>`
+      });
+    }
+
+    return res.status(200).json({ message: 'Password reset code sent to email.' });
+  } catch (err) {
+    return res.status(500).json({ message: err.message });
+  }
+});
+
+// @route   POST /api/auth/reset-password
+router.post('/reset-password', async (req, res) => {
+  const { email, code, newPassword } = req.body;
+  if (!email || !code || !newPassword) {
+    return res.status(400).json({ message: 'Email, code, and new password are required' });
+  }
+
+  try {
+    const user = await User.findOne({ email: email.toLowerCase() });
+    if (!user || user.resetPasswordToken !== code || user.resetPasswordExpires < new Date()) {
+      return res.status(400).json({ message: 'Invalid or expired reset code' });
+    }
+
+    const salt = await bcrypt.genSalt(10);
+    user.password = await bcrypt.hash(newPassword, salt);
+    user.resetPasswordToken = undefined;
+    user.resetPasswordExpires = undefined;
+    await user.save();
+
+    return res.status(200).json({ message: 'Password updated successfully.' });
+  } catch (err) {
+    return res.status(500).json({ message: err.message });
   }
 });
 
 module.exports = router;
+module.exports.authMiddleware = authMiddleware;
